@@ -1,0 +1,12 @@
+import Workspace.parser;
+
+func main(): int {
+    $args = System.args();
+    if (count($args) < 2) { println("użycie: zzc <plik.zs>"); return 2; }
+    try { parser.parse(File.read($args[1])); }
+    catch (Exception $e) { eprintln("zzc: " . $args[1] . ": " . $e->getMessage()); return 1; }
+    eprintln("zzc: składnia poprawna, ale backend GCC nie jest zaimplementowany");
+    return 3;
+}
+
+exit(main());
