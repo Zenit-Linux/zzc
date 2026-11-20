@@ -1,12 +1,168 @@
 import Workspace.parser;
+import Workspace.sema;
+import Workspace.ir;
+import Workspace.emit_c;
+
+##
+ * zzc — frontend Z# dla GCC. Sterownik w stylu gcc: tłumaczy .zs/.zsharp na C (Z# IR -> emit_c) i oddaje kompilację
+ * do GCC wraz z natywnym runtime (runtime/native/zs_rt.c). Nierozpoznane opcje trafiają bez zmian do gcc,
+ * więc działają -O2 -g -flto -march=native -fsanitize=address -static -Wl,... itd.
+ * Uwaga: to frontend „przez C" (jak wczesne cfront/f2c), a nie wtyczka cc1 — patrz README.
+##
+
+func version(): string { return "zzc 0.0.1 (frontend GCC: Z# -> C -> gcc)"; }
+
+func usage(): void {
+    echo "zzc — frontend Z# dla GCC";
+    echo "użycie: zzc [opcje gcc] <plik.zs> [-o wyjście]";
+    echo "  -c            tylko obiekt (.o) — bez runtime; zlinkuj z `zzc --runtime-obj`";
+    echo "  -S            asembler (.s) wygenerowany przez gcc";
+    echo "  --emit-c      tylko kod C (.c)";
+    echo "  --gcc <gcc>   kompilator (domyślnie $ZZC_GCC, potem gcc, cc); np. aarch64-linux-gnu-gcc";
+    echo "  --print-cmd   pokaż wywołanie gcc; --dry-run — nie uruchamiaj";
+    echo "  --runtime     wypisz ścieżkę runtime/native/zs_rt.c; --runtime-obj <wyjście.o> skompiluj runtime";
+    echo "  --strict      ostrzeżenia sema jako błędy; --version | --help";
+    echo "inne opcje (-O3, -g, -flto, -I.., -l.., -Wl,...) są przekazywane do gcc";
+    echo "zmienne: ZS_HOME (katalog Z-Sharp), ZZC_GCC";
+}
+
+func is_src(string $a): bool { return ends_with($a, ".zs") || ends_with($a, ".zsharp"); }
+
+func zs_root(string $scriptDir) {
+    $env = System.env("ZS_HOME");
+    if ($env !== null && $env !== "") { return $env; }
+    $f = System.resolveImport(["Workspace", "cli"], $scriptDir);
+    if ($f === null) { return null; }
+    return System.dirname(System.dirname($f));
+}
+
+func find_gcc($explicit) {
+    $cands = [];
+    if ($explicit !== null) { $cands[] = $explicit; }
+    $e = System.env("ZZC_GCC");
+    if ($e !== null && $e !== "") { $cands[] = $e; }
+    foreach (["gcc", "cc"] as $c) { $cands[] = $c; }
+    foreach ($cands as $c) {
+        try { $r = Process.run($c, ["--version"]); if ($r["status"] === 0) { return $c; } }
+        catch (Exception $x) { }
+    }
+    return null;
+}
+
+func stem(string $p): string {
+    $b = $p;
+    for ($i = 0; $i < strlen($p); $i++) { if (substr($p, $i, 1) === "/") { $b = substr($p, $i + 1); } }
+    $dot = -1;
+    for ($i = 0; $i < strlen($b); $i++) { if (substr($b, $i, 1) === ".") { $dot = $i; } }
+    return $dot > 0 ? substr($b, 0, $dot) : $b;
+}
+
+func quote(string $s): string {
+    if ($s === "" || contains($s, " ") || contains($s, "\"")) { return "'" . $s . "'"; }
+    return $s;
+}
+
+func translate(string $file, bool $strict) {
+    if (!File.exists($file)) { eecho("zzc: nie znaleziono pliku " . $file); return null; }
+    try { $ast = parser.parse(File.read($file)); }
+    catch (Exception $e) { eecho($file . ":" . $e->getMessage()); return null; }
+    $r = sema.analyze($ast);
+    foreach ($r["warnings"] as $w) { eecho($file . ":" . $w[0] . ": ostrzeżenie: " . $w[1]); }
+    if ($strict && count($r["warnings"]) > 0) { return null; }
+    $res = ir.lower($ast);
+    if (count($res["errors"]) > 0) {
+        foreach ($res["errors"] as $e) { eecho($file . ":" . $e[0] . ": błąd [" . $e[1] . "]: " . $e[2]); }
+        eecho("zzc: " . count($res["errors"]) . " błędów — konstrukcje spoza podzbioru natywnego; pełny język: zsi / `zsc build --emit zbc`");
+        return null;
+    }
+    try { return emit_c.generate($res); }
+    catch (Exception $e) { eecho("zzc: błąd wewnętrzny: " . $e->getMessage()); return null; }
+}
 
 func main(): int {
-    $args = System.args();
-    if (count($args) < 2) { println("użycie: zzc <plik.zs>"); return 2; }
-    try { parser.parse(File.read($args[1])); }
-    catch (Exception $e) { eprintln("zzc: " . $args[1] . ": " . $e->getMessage()); return 1; }
-    eprintln("zzc: składnia poprawna, ale backend GCC nie jest zaimplementowany");
-    return 3;
+    $argv = System.args();
+    $scriptDir = System.dirname($argv[0]);
+    $mode = "exe";
+    $out = null;
+    $gccExe = null;
+    $printCmd = false;
+    $dry = false;
+    $strict = false;
+    $emitC = false;
+    $srcs = [];
+    $pass = [];
+    $i = 1;
+    while ($i < count($argv)) {
+        $a = $argv[$i];
+        if ($a === "--version") { echo version(); return 0; }
+        else if ($a === "--help" || $a === "-h") { usage(); return 0; }
+        else if ($a === "-c") { $mode = "obj"; }
+        else if ($a === "-S") { $mode = "asm"; }
+        else if ($a === "--emit-c") { $emitC = true; }
+        else if ($a === "--print-cmd") { $printCmd = true; }
+        else if ($a === "--dry-run") { $dry = true; $printCmd = true; }
+        else if ($a === "--strict") { $strict = true; }
+        else if ($a === "--gcc" && $i + 1 < count($argv)) { $i++; $gccExe = $argv[$i]; }
+        else if ($a === "-o" && $i + 1 < count($argv)) { $i++; $out = $argv[$i]; }
+        else if ($a === "-x" && $i + 1 < count($argv)) { $i++; }
+        else if ($a === "build") { }
+        else if ($a === "--runtime") {
+            $root = zs_root($scriptDir);
+            if ($root === null) { eecho("zzc: ustaw ZS_HOME"); return 1; }
+            echo $root . "/runtime/native/zs_rt.c";
+            return 0;
+        }
+        else if ($a === "--runtime-obj" && $i + 1 < count($argv)) {
+            $i++;
+            $root = zs_root($scriptDir);
+            $g = find_gcc($gccExe);
+            if ($root === null || $g === null) { eecho("zzc: brak ZS_HOME lub gcc"); return 1; }
+            $r = Process.run($g, ["-c", "-O2", "-std=gnu11", "-w", "-I", $root . "/runtime/include", $root . "/runtime/native/zs_rt.c", "-o", $argv[$i]]);
+            if ($r["status"] !== 0) { eecho($r["stderr"]); return 1; }
+            return 0;
+        }
+        else if (is_src($a)) { $srcs[] = $a; }
+        else { $pass[] = $a; }
+        $i++;
+    }
+    if (count($srcs) === 0) { usage(); return 2; }
+    if (count($srcs) > 1) { eecho("zzc: jeden plik źródłowy na wywołanie (moduły Z# w backendzie natywnym: todo)"); return 2; }
+    $src = $srcs[0];
+    $c = translate($src, $strict);
+    if ($c === null) { return 1; }
+    $base = stem($src);
+    if ($emitC) {
+        $cp = $out ?? ($base . ".c");
+        File.write($cp, $c);
+        echo "zzc: " . $cp;
+        return 0;
+    }
+    $root = zs_root($scriptDir);
+    if ($root === null || !File.exists($root . "/runtime/native/zs_rt.c")) { eecho("zzc: nie znaleziono Z-Sharp/runtime/native/zs_rt.c — ustaw ZS_HOME"); return 1; }
+    $gcc = find_gcc($gccExe);
+    if ($gcc === null) { eecho("zzc: nie znaleziono gcc (zainstaluj lub użyj --gcc / ZZC_GCC)"); return 1; }
+    $tmp = ($out ?? $base) . ".zzc.c";
+    File.write($tmp, $c);
+    $args = ["-std=gnu11", "-w", "-I", $root . "/runtime/include"];
+    $hasOpt = false;
+    foreach ($pass as $p) { if (starts_with($p, "-O")) { $hasOpt = true; } }
+    if (!$hasOpt) { $args[] = "-O2"; }
+    foreach ($pass as $p) { $args[] = $p; }
+    if ($mode === "obj") { $args[] = "-c"; $args[] = $tmp; $args[] = "-o"; $args[] = $out ?? ($base . ".o"); }
+    else if ($mode === "asm") { $args[] = "-S"; $args[] = $tmp; $args[] = "-o"; $args[] = $out ?? ($base . ".s"); }
+    else { $args[] = $tmp; $args[] = $root . "/runtime/native/zs_rt.c"; $args[] = "-o"; $args[] = $out ?? $base; $args[] = "-lm"; }
+    if ($printCmd) {
+        $q = [];
+        foreach ($args as $a) { $q[] = quote($a); }
+        eecho("+ " . $gcc . " " . join($q, " "));
+    }
+    if ($dry) { File.delete($tmp); return 0; }
+    $r = Process.run($gcc, $args);
+    File.delete($tmp);
+    if ($r["status"] !== 0) { eecho($r["stderr"]); eecho("zzc: gcc zakończył się błędem " . $r["status"]); return 1; }
+    if ($r["stderr"] !== "") { eecho($r["stderr"]); }
+    echo "zzc: " . ($out ?? ($mode === "obj" ? $base . ".o" : ($mode === "asm" ? $base . ".s" : $base)));
+    return 0;
 }
 
 exit(main());
