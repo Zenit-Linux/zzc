@@ -1,1 +1,10 @@
+[package]
+name = "zzc"
+version = "0.0.1"
+kind = "bin"
+entry = "src/main.zsharp"
+description = "Frontend Z# dla GCC (Z# -> C -> gcc, z natywnym runtime)"
+license = "MIT"
 
+[dependencies]
+Z-Sharp = { git = "https://github.com/Zenit-Linux/Z-Sharp", path = "Z-Sharp" }
