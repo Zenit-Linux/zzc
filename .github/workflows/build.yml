@@ -1,1 +1,90 @@
+name: build
 
+# Buduje zzc ze źródeł (Frontend GCC dla Z#): pobiera instalator Z# z repo Z-Sharp, instaluje Z# i kompiluje
+# `src/main.zsharp` do samodzielnej binarki. Przy publikacji wydania dołącza binarkę `zzc` do assetów —
+# dokładnie pod nazwą, z której pobiera ją scripts/Linux-Distributions/install.sh.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  ZS_ORG: Zenit-Linux
+  ZS_REF: main   # gałąź/tag repo Z-Sharp używany jako zależność (rdzeń: lexer, parser, ir, runtime…)
+
+jobs:
+  build:
+    name: build zzc (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout zzc
+        uses: actions/checkout@v4
+
+      - name: Pobierz instalator Z#
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${ZS_ORG}/Z-Sharp/main/scripts/Linux-Distributions/install.sh" -o "$RUNNER_TEMP/install.sh"
+          head -n 3 "$RUNNER_TEMP/install.sh"
+
+      - name: Zainstaluj Z# (zsi, zsc, zst, zzc)
+        id: install
+        continue-on-error: true   # przy pierwszym wydaniu binarki mogą jeszcze nie istnieć — wtedy działa krok awaryjny
+        run: |
+          sh "$RUNNER_TEMP/install.sh" --immutable
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Pobierz rdzeń Z-Sharp (zależność)
+        run: git clone --depth 1 --branch "$ZS_REF" "https://github.com/${ZS_ORG}/Z-Sharp.git" Z-Sharp
+
+      - name: Awaryjnie zbuduj Z# ze źródeł (gdy instalacja się nie powiodła)
+        if: steps.install.outcome != 'success'
+        run: |
+          cargo build --release --manifest-path Z-Sharp/stage0/Cargo.toml --target-dir Z-Sharp/target
+          export ZSC0="$PWD/Z-Sharp/target/release/zsc0" ZS_HOME="$PWD/Z-Sharp"
+          git clone --depth 1 "https://github.com/${ZS_ORG}/zsi.git" "$RUNNER_TEMP/zsi-src"
+          ln -s "$ZS_HOME" "$RUNNER_TEMP/zsi-src/Z-Sharp"
+          mkdir -p "$HOME/.local/bin"
+          (cd "$RUNNER_TEMP/zsi-src" && "$ZSC0" run src/main.zsharp --compile src/main.zsharp -o "$HOME/.local/bin/zsi")
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Wersje narzędzi
+        run: zsi --version
+
+      - name: Zbuduj zzc ze źródeł
+        env:
+          ZS_HOME: ${{ github.workspace }}/Z-Sharp
+        run: |
+          mkdir -p build
+          zsi --compile src/main.zsharp -o build/zzc
+          ls -l build/zzc
+
+      - name: Test dymny
+        env:
+          ZS_HOME: ${{ github.workspace }}/Z-Sharp
+        run: |
+          set -e
+          ./build/zzc --version
+          printf 'echo "hi", 1 + 2;\n' > "$RUNNER_TEMP/hello.zs"
+          ./build/zzc "$RUNNER_TEMP/hello.zs" -o "$RUNNER_TEMP/hello"
+          out="$("$RUNNER_TEMP/hello")"
+          [ "$out" = "hi 3" ] || { echo "zzc: zły wynik programu: $out"; exit 1; }
+
+      - name: Zapisz binarkę (artefakt)
+        uses: actions/upload-artifact@v4
+        with:
+          name: zzc-linux
+          path: build/zzc
+          if-no-files-found: error
+
+      - name: Dołącz binarkę do wydania
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" build/zzc --clobber
