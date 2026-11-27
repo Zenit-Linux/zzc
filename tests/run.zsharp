@@ -1,0 +1,20 @@
+#!/bin/bash
+# Testy zzc (frontend GCC). Wymaga zzc i gcc, Z-Sharp obok.
+HERE=$(cd "$(dirname "$0")" && pwd); ZS=${ZS_HOME:-$HERE/../Z-Sharp}; export ZS_HOME=$ZS
+ZZC=${ZZC:-zzc}; T=$(mktemp -d); trap 'rm -rf "$T"' EXIT; export ZZC_CACHE=$T/cache; fail=0
+ok() { echo "ok   $1"; }; bad() { echo "FAIL $1"; fail=1; }
+cat > $T/c.zs <<'Z'
+class A { public $n; function __construct($n) { $this->n = $n; } function dbl() { return $this->n * 2; } }
+$a = new A(21); echo $a->dbl(), [1, 2];
+Z
+$ZZC $T/c.zs -o $T/c >/dev/null 2>&1 && [ "$($T/c)" = "42 [1, 2]" ] && ok "build (klasy)" || bad "build (klasy)"
+n1=$(ls $T/cache | wc -l); $ZZC $T/c.zs -o $T/c2 >/dev/null 2>&1; [ "$(ls $T/cache | wc -l)" = "$n1" ] && ok "cache runtime: ponowne użycie" || bad "cache runtime: ponowne użycie"
+$ZZC -O3 -flto $T/c.zs -o $T/c3 >/dev/null 2>&1 && [ "$($T/c3)" = "42 [1, 2]" ] && ok "-O3 -flto" || bad "-O3 -flto"
+[ "$(ls $T/cache | wc -l)" -gt "$n1" ] && ok "cache runtime: osobny wpis dla innych flag" || bad "cache runtime: osobny wpis dla innych flag"
+out=$($ZZC --dry-run -O1 -g $T/c.zs 2>&1); echo "$out" | grep -q -- "-O1 -g" && ok "--dry-run pokazuje gcc" || bad "--dry-run pokazuje gcc"
+$ZZC -c $T/c.zs -o $T/c.o >/dev/null 2>&1 && file $T/c.o | grep -q ELF && ok "-c (obiekt)" || bad "-c (obiekt)"
+$ZZC -S $T/c.zs -o $T/c.s >/dev/null 2>&1 && grep -q "\.text" $T/c.s && ok "-S (asm)" || bad "-S (asm)"
+[ "$($ZZC run $T/c.zs 2>/dev/null)" = "42 [1, 2]" ] && ok run || bad run
+echo 'function (' > $T/b.zs; $ZZC $T/b.zs -o $T/b >/dev/null 2>&1; [ $? = 1 ] && ok "błąd składni => 1" || bad "błąd składni => 1"
+"$ZS/tests/run_conformance.sh" zzc | tail -1 | grep -q " 0 błędów" && ok conformance || bad conformance
+exit $fail
