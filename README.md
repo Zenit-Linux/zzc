@@ -1,20 +1,17 @@
-# zzc — frontend Z# dla GCC (0.0.1)
+# zzc — frontend gcc
 
-`zzc` to sterownik w stylu `gcc` dla Z#: parsuje i analizuje źródło (rdzeń `Z-Sharp`), obniża je do Z# IR i C (`emit_c`)
-i oddaje kompilację do **GCC** razem z natywnym runtime (`Z-Sharp/runtime/native/zs_rt.c`). Opcje, których `zzc` nie zna,
-trafiają do gcc bez zmian (`-O3 -g -flto -march=native -fsanitize=address -static -Wl,...`).
+`zzc [opcje gcc] prog.zs [-o wyjście]` — Z# → IR → C → **gcc**. Pełny język: klasy, domknięcia, wyjątki, `import` modułów.
 
 ```
-zzc prog.zs -o prog            # binarka (gcc -O2)
-zzc -O3 -flto prog.zs -o prog
-zzc -S prog.zs                 # asembler z gcc
-zzc -c prog.zs                 # obiekt; runtime: zzc --runtime-obj zs_rt.o
-zzc --emit-c prog.zs           # tylko C
-zzc --gcc aarch64-linux-gnu-gcc prog.zs -o prog.arm64   # cross-kompilacja
+zzc prog.zs -o prog            # -O2 domyślnie
+zzc -O3 -flto -g prog.zs
+zzc -c prog.zs -o prog.o       # tylko obiekt;  -S → asembler
+zzc run prog.zs -- argumenty   # zbuduj i uruchom
+zzc --dry-run --print-cmd ...  # pokaż wywołanie gcc
+zzc --gcc aarch64-linux-gnu-gcc prog.zs   # kompilator skrośny (niezweryfikowane)
 ```
 
-## Stan (uczciwie)
-* Działa: podzbiór natywny (funkcje, tablice, napisy, int/float/bool, pętle, switch, try/catch/finally) — ten sam co `zsc`, ta sama semantyka (testy różnicowe w `zsc/tests/native`).
-* To frontend **przez C**, a nie wtyczka `cc1` z drzewami GENERIC/GIMPLE. Prawdziwy frontend GCC (język w drzewie źródeł GCC, `lang.opt`, `z#-lang.c`) jest celem długoterminowym; ten sterownik daje już pełne optymalizacje gcc (LTO, PGO, sanitizery, cross).
-* Brak: klas, domknięć, modułów Z# w kodzie natywnym (jawny błąd z linią) — pełny język: `zsi`.
-* Jeden plik źródłowy na wywołanie.
+Obiekt runtime (`zs_rt.c`) jest kompilowany **raz na zestaw flag kompilacji** i trzymany w `~/.cache/zzc` (`ZZC_CACHE`); `--no-cache` to wyłącza.
+Flagi `-O* -f* -m* -g* -D* -std*` wpływają na klucz cache, pozostałe (`-l`, `-L`, `-Wl,`) idą tylko do linkowania.
+To sterownik gcc (nie wtyczka `cc1`). Jeden plik wejściowy na wywołanie; pozostałe moduły przez `import`.
+Kody wyjścia: 0 ok · 1 błąd (składnia, moduły, gcc) · 2 użycie. Testy: `tests/run.sh`.
