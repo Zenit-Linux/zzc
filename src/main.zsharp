@@ -1,6 +1,7 @@
 import Workspace.parser;
 import Workspace.sema;
 import Workspace.ir;
+import Workspace.link;
 import Workspace.emit_c;
 
 ##
@@ -10,7 +11,7 @@ import Workspace.emit_c;
  * Uwaga: to frontend „przez C" (jak wczesne cfront/f2c), a nie wtyczka cc1 — patrz README.
 ##
 
-func version(): string { return "zzc 0.0.1 (frontend GCC: Z# -> C -> gcc)"; }
+func version(): string { return "zzc 0.1.0 (frontend GCC: Z# -> IR -> C -> gcc; pełny język, importy, cache runtime)"; }
 
 func usage(): void {
     echo "zzc — frontend Z# dla GCC";
@@ -19,6 +20,7 @@ func usage(): void {
     echo "  -S            asembler (.s) wygenerowany przez gcc";
     echo "  --emit-c      tylko kod C (.c)";
     echo "  --gcc <gcc>   kompilator (domyślnie $ZZC_GCC, potem gcc, cc); np. aarch64-linux-gnu-gcc";
+    echo "  run <plik> [-- args]   zbuduj i uruchom;  --no-cache — nie używaj cache runtime";
     echo "  --print-cmd   pokaż wywołanie gcc; --dry-run — nie uruchamiaj";
     echo "  --runtime     wypisz ścieżkę runtime/native/zs_rt.c; --runtime-obj <wyjście.o> skompiluj runtime";
     echo "  --strict      ostrzeżenia sema jako błędy; --version | --help";
@@ -31,6 +33,11 @@ func is_src(string $a): bool { return ends_with($a, ".zs") || ends_with($a, ".zs
 func zs_root(string $scriptDir) {
     $env = System.env("ZS_HOME");
     if ($env !== null && $env !== "") { return $env; }
+    $d = $scriptDir;
+    if (!starts_with($d, "/")) { $d = (System.env("PWD") ?? ".") . "/" . $d; }
+    foreach ([$d . "/../share/z-sharp", $d . "/share/z-sharp"] as $c) {
+        if (File.exists($c . "/runtime/native/zs_rt.c")) { return $c; }
+    }
     $f = System.resolveImport(["Workspace", "cli"], $scriptDir);
     if ($f === null) { return null; }
     return System.dirname(System.dirname($f));
@@ -57,6 +64,13 @@ func stem(string $p): string {
     return $dot > 0 ? substr($b, 0, $dot) : $b;
 }
 
+func array_concat($a, $b) {
+    $o = [];
+    foreach ($a as $x) { $o[] = $x; }
+    foreach ($b as $x) { $o[] = $x; }
+    return $o;
+}
+
 func quote(string $s): string {
     if ($s === "" || contains($s, " ") || contains($s, "\"")) { return "'" . $s . "'"; }
     return $s;
@@ -69,14 +83,85 @@ func translate(string $file, bool $strict) {
     $r = sema.analyze($ast);
     foreach ($r["warnings"] as $w) { eecho($file . ":" . $w[0] . ": ostrzeżenie: " . $w[1]); }
     if ($strict && count($r["warnings"]) > 0) { return null; }
-    $res = ir.lower($ast);
+    $lk = link.link($ast, $file);
+    if (count($lk["errors"]) > 0) {
+        foreach ($lk["errors"] as $e) { eecho($e[3] . ":" . $e[0] . ": błąd [" . $e[1] . "]: " . $e[2]); }
+        eecho("zzc: " . count($lk["errors"]) . " błędów linkowania modułów");
+        return null;
+    }
+    $res = ir.lower($lk["ast"]);
     if (count($res["errors"]) > 0) {
         foreach ($res["errors"] as $e) { eecho($file . ":" . $e[0] . ": błąd [" . $e[1] . "]: " . $e[2]); }
-        eecho("zzc: " . count($res["errors"]) . " błędów — konstrukcje spoza podzbioru natywnego; pełny język: zsi / `zsc build --emit zbc`");
+        eecho("zzc: " . count($res["errors"]) . " błędów — konstrukcje spoza zakresu backendu natywnego");
         return null;
     }
     try { return emit_c.generate($res); }
     catch (Exception $e) { eecho("zzc: błąd wewnętrzny: " . $e->getMessage()); return null; }
+}
+
+func hex32($h): string {
+    $d = "0123456789abcdef";
+    $o = "";
+    for ($i = 0; $i < 8; $i++) { $o = substr($d, $h & 15, 1) . $o; $h = $h >> 4; }
+    return $o;
+}
+
+func fnv(string $s): string {
+    $h = 2166136261;
+    $n = strlen($s);
+    for ($i = 0; $i < $n; $i++) { $h = (($h ^ ord(substr($s, $i, 1))) * 16777619) & 4294967295; }
+    return hex32($h);
+}
+
+func mkdirs($path) {
+    if (Directory.exists($path)) { return; }
+    $cur = starts_with($path, "/") ? "" : ".";
+    foreach (split($path, "/") as $p) {
+        if ($p === "") { continue; }
+        $cur = $cur . "/" . $p;
+        if (!Directory.exists($cur)) { Directory.create($cur); }
+    }
+}
+
+func cache_dir(): string {
+    $e = System.env("ZZC_CACHE");
+    if ($e !== null && $e !== "") { return $e; }
+    $x = System.env("XDG_CACHE_HOME");
+    if ($x !== null && $x !== "") { return $x . "/zzc"; }
+    return (System.env("HOME") ?? "/tmp") . "/.cache/zzc";
+}
+
+# flagi wpływające na kod obiektowy runtime (kompilacja); reszta (-l, -L, -Wl,...) idzie tylko do linkowania
+func is_cflag(string $p): bool {
+    return starts_with($p, "-O") || starts_with($p, "-f") || starts_with($p, "-m") || starts_with($p, "-g") || starts_with($p, "-D") || starts_with($p, "-pg") || starts_with($p, "--target") || starts_with($p, "-std");
+}
+
+##
+ * Obiekt runtime: kompilowany raz na (gcc, flagi, wersja źródeł) i trzymany w cache.
+##
+func runtime_object($gcc, $root, $cflags) {
+    $src = $root . "/runtime/native/zs_rt.c";
+    $hdr = $root . "/runtime/include/zs_native.h";
+    $ss = File.stat($src);
+    $hs = File.stat($hdr);
+    $v = Process.run($gcc, ["-dumpfullversion", "-dumpmachine"]);
+    $key = fnv($gcc . "|" . join($cflags, " ") . "|" . trim($v["stdout"]) . "|" . $ss["size"] . ":" . $ss["mtime"] . ":" . $hs["size"] . ":" . $hs["mtime"]);
+    $dir = cache_dir();
+    $obj = $dir . "/rt-" . $key . ".o";
+    if (File.exists($obj)) { return $obj; }
+    try { mkdirs($dir); } catch (Exception $e) { return null; }
+    $tmp = $obj . "." . System.pid() . ".tmp";
+    $args = ["-c", "-std=gnu11", "-w", "-I", $root . "/runtime/include"];
+    $hasOpt = false;
+    foreach ($cflags as $f) { if (starts_with($f, "-O")) { $hasOpt = true; } $args[] = $f; }
+    if (!$hasOpt) { $args[] = "-O2"; }
+    $args[] = $src;
+    $args[] = "-o";
+    $args[] = $tmp;
+    $r = Process.run($gcc, $args);
+    if ($r["status"] !== 0) { eecho($r["stderr"]); return null; }
+    File.rename($tmp, $obj);
+    return $obj;
 }
 
 func main(): int {
@@ -91,6 +176,9 @@ func main(): int {
     $emitC = false;
     $srcs = [];
     $pass = [];
+    $run = false;
+    $runArgs = [];
+    $cacheOff = [];
     $i = 1;
     while ($i < count($argv)) {
         $a = $argv[$i];
@@ -106,6 +194,9 @@ func main(): int {
         else if ($a === "-o" && $i + 1 < count($argv)) { $i++; $out = $argv[$i]; }
         else if ($a === "-x" && $i + 1 < count($argv)) { $i++; }
         else if ($a === "build") { }
+        else if ($a === "run") { $run = true; }
+        else if ($a === "--no-cache") { $cacheOff["x"] = true; }
+        else if ($a === "--") { for ($j = $i + 1; $j < count($argv); $j++) { $runArgs[] = $argv[$j]; } break; }
         else if ($a === "--runtime") {
             $root = zs_root($scriptDir);
             if ($root === null) { eecho("zzc: ustaw ZS_HOME"); return 1; }
@@ -126,7 +217,7 @@ func main(): int {
         $i++;
     }
     if (count($srcs) === 0) { usage(); return 2; }
-    if (count($srcs) > 1) { eecho("zzc: jeden plik źródłowy na wywołanie (moduły Z# w backendzie natywnym: todo)"); return 2; }
+    if (count($srcs) > 1) { eecho("zzc: jeden plik wejściowy na wywołanie (pozostałe moduły przez `import`)"); return 2; }
     $src = $srcs[0];
     $c = translate($src, $strict);
     if ($c === null) { return 1; }
@@ -143,25 +234,36 @@ func main(): int {
     if ($gcc === null) { eecho("zzc: nie znaleziono gcc (zainstaluj lub użyj --gcc / ZZC_GCC)"); return 1; }
     $tmp = ($out ?? $base) . ".zzc.c";
     File.write($tmp, $c);
-    $args = ["-std=gnu11", "-w", "-I", $root . "/runtime/include"];
+    $cflags = [];
     $hasOpt = false;
-    foreach ($pass as $p) { if (starts_with($p, "-O")) { $hasOpt = true; } }
+    foreach ($pass as $p) { if (starts_with($p, "-O")) { $hasOpt = true; } if (is_cflag($p)) { $cflags[] = $p; } }
+    $args = ["-std=gnu11", "-w", "-I", $root . "/runtime/include"];
     if (!$hasOpt) { $args[] = "-O2"; }
     foreach ($pass as $p) { $args[] = $p; }
-    if ($mode === "obj") { $args[] = "-c"; $args[] = $tmp; $args[] = "-o"; $args[] = $out ?? ($base . ".o"); }
-    else if ($mode === "asm") { $args[] = "-S"; $args[] = $tmp; $args[] = "-o"; $args[] = $out ?? ($base . ".s"); }
-    else { $args[] = $tmp; $args[] = $root . "/runtime/native/zs_rt.c"; $args[] = "-o"; $args[] = $out ?? $base; $args[] = "-lm"; }
-    if ($printCmd) {
-        $q = [];
-        foreach ($args as $a) { $q[] = quote($a); }
-        eecho("+ " . $gcc . " " . join($q, " "));
+    $dest = $out ?? ($mode === "obj" ? $base . ".o" : ($mode === "asm" ? $base . ".s" : $base));
+    $steps = [];
+    if ($mode === "obj") { $steps[] = array_concat($args, ["-c", $tmp, "-o", $dest]); }
+    else if ($mode === "asm") { $steps[] = array_concat($args, ["-S", $tmp, "-o", $dest]); }
+    else {
+        $rtobj = has_key($cacheOff, "x") ? null : runtime_object($gcc, $root, $cflags);
+        if ($dry && $rtobj === null) { $rtobj = "<runtime.o>"; }
+        if ($rtobj !== null) { $steps[] = array_concat($args, [$tmp, $rtobj, "-o", $dest, "-lm"]); }
+        else { $steps[] = array_concat($args, [$tmp, $root . "/runtime/native/zs_rt.c", "-o", $dest, "-lm"]); }
     }
-    if ($dry) { File.delete($tmp); return 0; }
-    $r = Process.run($gcc, $args);
+    foreach ($steps as $st) {
+        if ($printCmd) {
+            $q = [];
+            foreach ($st as $a) { $q[] = quote($a); }
+            eecho("+ " . $gcc . " " . join($q, " "));
+        }
+        if ($dry) { continue; }
+        $r = Process.run($gcc, $st);
+        if ($r["status"] !== 0) { File.delete($tmp); eecho($r["stderr"]); eecho("zzc: gcc zakończył się błędem " . $r["status"]); return 1; }
+        if ($r["stderr"] !== "") { eecho($r["stderr"]); }
+    }
     File.delete($tmp);
-    if ($r["status"] !== 0) { eecho($r["stderr"]); eecho("zzc: gcc zakończył się błędem " . $r["status"]); return 1; }
-    if ($r["stderr"] !== "") { eecho($r["stderr"]); }
-    echo "zzc: " . ($out ?? ($mode === "obj" ? $base . ".o" : ($mode === "asm" ? $base . ".s" : $base)));
+    if ($run && $mode === "exe" && !$dry) { return Process.exec(starts_with($dest, "/") ? $dest : "./" . $dest, $runArgs); }
+    echo "zzc: " . $dest;
     return 0;
 }
 
